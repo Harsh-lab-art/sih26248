@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Fog-of-Command</title>
+<style>
+:root{--bg:#10141c;--panel:#18202c;--line:#2a3547;--tx:#dbe3ef;--mut:#8a97ab;--acc:#4da3ff;--warn:#ffb347;--bad:#ff6b6b;--ok:#5fd38d}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.45 system-ui,sans-serif}
+header{display:flex;gap:12px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--line)}
+header h1{font-size:16px;margin:0}.pill{padding:2px 10px;border-radius:99px;background:var(--panel);border:1px solid var(--line);color:var(--mut)}
+.grid{display:grid;grid-template-columns:minmax(300px,520px) 1fr;gap:14px;padding:14px}
+@media(max-width:900px){.grid{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px}
+h3{margin:0 0 8px;font-size:13px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em}
+button,select,input{background:#0f151f;color:var(--tx);border:1px solid var(--line);border-radius:6px;padding:7px 10px;font:inherit}
+button{cursor:pointer}button.p{background:var(--acc);color:#04111f;border-color:var(--acc);font-weight:600}
+svg{width:100%;background:#0c1118;border:1px solid var(--line);border-radius:8px;cursor:crosshair;display:block}
+.feed{max-height:260px;overflow:auto;display:flex;flex-direction:column;gap:6px}
+.msg{padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:#0f151f}.msg small{color:var(--mut)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
+#join{max-width:520px;margin:60px auto;text-align:center}#join button{margin:6px;padding:12px 20px}
+table{border-collapse:collapse;width:100%;font-size:12.5px}td,th{border-bottom:1px solid var(--line);padding:4px 6px;text-align:left;vertical-align:top}
+.s-delivered{color:var(--ok)}.s-dropped{color:var(--bad)}.s-conflicting{color:var(--warn)}.s-spoofed{color:#d98cff}
+.sl{display:grid;grid-template-columns:70px 1fr 48px;gap:6px;align-items:center}.sl input{padding:0}
+</style></head><body>
+<header><h1>Fog-of-Command</h1><span class="pill" id="who">not joined</span><span class="pill" id="status">idle</span><span class="pill" id="clock">T+0s</span></header>
+
+<div id="join" class="card"><h3>Join exercise as</h3>
+<button class="p" data-r="instructor">Instructor</button><button data-r="alpha">Trainee Alpha</button><button data-r="bravo">Trainee Bravo</button>
+<p style="color:var(--mut)">Open Instructor in one tab and each trainee in another.</p></div>
+
+<div id="trainee" class="grid" hidden>
+  <div class="card"><h3 id="ttl">Map</h3><svg id="tmap" viewBox="0 0 100 100"></svg>
+    <div class="row"><select id="act"><option>move</option><option>engage</option><option>hold</option><option>request_support</option><option>verify</option></select>
+    <input id="why" placeholder="Rationale (what do you believe and why?)" style="flex:1;min-width:160px"><button class="p" id="send">Issue order</button></div>
+    <div id="tgt" style="color:var(--mut);margin-top:6px">Click the map to set a target.</div><div id="ack" style="color:var(--ok)"></div></div>
+  <div class="card"><h3>Incoming reports</h3><div class="feed" id="feed"></div></div>
+</div>
+
+<div id="instr" class="grid" hidden>
+  <div class="card"><h3>Truth view (instructor only)</h3><svg id="imap" viewBox="0 0 100 100" style="cursor:default"></svg>
+    <div class="row"><button class="p" id="start">Start</button><button id="reset">Reset</button><button id="aarbtn">Open AAR</button></div></div>
+  <div>
+    <div class="card"><h3>Link degradation (live)</h3><div id="links"></div>
+      <div class="row"><button id="jam">Jam Alpha</button><button id="clear">Clear all</button></div></div>
+    <div class="card" style="margin-top:14px"><h3>Live log</h3><div class="feed" id="log"></div></div>
+  </div>
+  <div class="card" style="grid-column:1/-1" id="aar" hidden></div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);let ws,role,init,target=null,reports=[],enemyTruth=null,shownPos={};
+const NS="http://www.w3.org/2000/svg";
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+document.querySelectorAll('#join button').forEach(b=>b.onclick=()=>connect(b.dataset.r));
+
+const API_BASE = (location.protocol === 'http:' || location.protocol === 'https:') ? '' : 'http://localhost:8000';
+const WS_HOST = location.host || 'localhost:8000';
+const WS_PROTO = location.protocol === 'https:' ? 'wss' : 'ws';
+
+function connect(r){
+  role=r;
+  ws=new WebSocket(`${WS_PROTO}://${WS_HOST}/ws/${r}`);
+  ws.onmessage=e=>handle(JSON.parse(e.data));
+  ws.onclose=()=>$('who').textContent=r+' (disconnected)';
+  ws.onerror=()=>$('who').textContent=r+' (connection failed - make sure http://localhost:8000 is running)';
+}
+
+function handle(m){
+  if(m.type==='init'){init=m;$('join').hidden=true;$('who').textContent=role;setStatus(m.status);
+    if(role==='instructor'){$('instr').hidden=false;buildLinks(m.rules);drawI()}
+    else{$('trainee').hidden=false;$('ttl').textContent=m.title+' — '+m.own.unit;reports=m.reports;drawT();feed()}}
+  else if(m.type==='tick')$('clock').textContent='T+'+Math.floor(m.t)+'s';
+  else if(m.type==='state'){setStatus(m.status);if(m.status==='running'){reports=[];if(role==='instructor'){$('log').innerHTML='';$('aar').hidden=true}else{feed();drawT()}}}
+  else if(m.type==='report'){reports.push(m.report);feed();drawT()}
+  else if(m.type==='ack')$('ack').textContent=m.ok?`Order #${m.decision_id} logged at T+${m.t}s`:m.error;
+  else if(m.type==='truth'){enemyTruth=m.enemy;drawI()}
+  else if(m.type==='delivery')logLine(`<span class="s-${m.status}">${m.status}</span> → ${m.role}: ${esc(m.shown_text||'(lost)')} <small>delay ${m.delay_s??'-'}s (truth: ${esc(m.truth_text)})</small>`);
+  else if(m.type==='decision')logLine(`<b>${m.role}</b> ${m.action} ${m.target?`@${m.target.map(Math.round)}`:''} — <i>${esc(m.rationale||'no rationale')}</i><br><small>${m.label} · belief gap ${m.belief_distance??'-'} · truth gap ${m.truth_distance??'-'} · uncertainty ${m.uncertainty}</small>`);
+  else if(m.type==='rules')buildLinks(m.rules);
+}
+function setStatus(s){$('status').textContent=s}
+function logLine(h){const d=document.createElement('div');d.className='msg';d.innerHTML=h;$('log').prepend(d)}
+
+// ---------- trainee ----------
+function el(t,a,p){const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);p.appendChild(e);return e}
+function base(svg){svg.innerHTML='';for(let i=0;i<=100;i+=10){el('line',{x1:i,y1:0,x2:i,y2:100,stroke:'#1b2433','stroke-width':.3},svg);el('line',{x1:0,y1:i,x2:100,y2:i,stroke:'#1b2433','stroke-width':.3},svg)}}
+function drawT(){const s=$('tmap');base(s);const o=init.own;el('circle',{cx:o.pos[0],cy:o.pos[1],r:2.2,fill:'#4da3ff'},s);
+  const t=el('text',{x:o.pos[0]+3,y:o.pos[1]+1,fill:'#4da3ff','font-size':3},s);t.textContent='YOU';
+  reports.filter(r=>r.pos).forEach((r,i,a)=>{const age=a.length-1-i;const c=el('circle',{cx:r.pos[0],cy:r.pos[1],r:2,fill:'none',stroke:'#ffb347','stroke-width':.7,opacity:Math.max(.25,1-age*.2)},s);
+    const x=el('text',{x:r.pos[0]+3,y:r.pos[1]+1,fill:'#ffb347','font-size':2.6,opacity:Math.max(.35,1-age*.2)},s);x.textContent=r.id+' (sent T+'+r.sent_t+')'});
+  if(target){el('line',{x1:target[0]-2,y1:target[1],x2:target[0]+2,y2:target[1],stroke:'#5fd38d','stroke-width':.8},s);el('line',{x1:target[0],y1:target[1]-2,x2:target[0],y2:target[1]+2,stroke:'#5fd38d','stroke-width':.8},s)}}
+$('tmap').onclick=e=>{const r=e.currentTarget.getBoundingClientRect();target=[Math.round((e.clientX-r.left)/r.width*100),Math.round((e.clientY-r.top)/r.height*100)];$('tgt').textContent=`Target: ${target[0]}/${target[1]}`;drawT()};
+function feed(){const f=$('feed');f.innerHTML='';[...reports].reverse().forEach(r=>{const d=document.createElement('div');d.className='msg';d.textContent=r.text;
+  const s=document.createElement('small');s.textContent=` — ${r.id} · stamped T+${r.sent_t}s · received T+${r.recv_t}s`;d.appendChild(s);f.appendChild(d)})}
+$('send').onclick=()=>{ws.send(JSON.stringify({type:'decision',action:$('act').value,target,rationale:$('why').value}));$('why').value=''};
+
+// ---------- instructor ----------
+function drawI(){const s=$('imap');base(s);for(const k in init.units){const u=init.units[k];el('circle',{cx:u.pos[0],cy:u.pos[1],r:2.2,fill:'#4da3ff'},s);const t=el('text',{x:u.pos[0]+3,y:u.pos[1]+1,fill:'#4da3ff','font-size':3},s);t.textContent=k}
+  if(enemyTruth){el('rect',{x:enemyTruth[0]-2,y:enemyTruth[1]-2,width:4,height:4,fill:'#ff6b6b'},s);const t=el('text',{x:enemyTruth[0]+3,y:enemyTruth[1],fill:'#ff6b6b','font-size':3},s);t.textContent='TRUE enemy'}}
+const FIELDS=[['delay',0,15,.5],['jitter',0,5,.1],['dropout',0,1,.05],['conflict',0,1,.05],['spoof',0,1,.05]];
+function buildLinks(rules){const w=$('links');w.innerHTML='';for(const link in rules){const h=document.createElement('div');h.innerHTML=`<b>${link}</b>`;
+  FIELDS.forEach(([f,lo,hi,st])=>{const r=document.createElement('div');r.className='sl';r.innerHTML=`<span>${f}</span><input type="range" min="${lo}" max="${hi}" step="${st}" value="${rules[link][f]}"><span>${rules[link][f]}</span>`;
+    const i=r.querySelector('input'),v=r.lastChild;i.oninput=()=>{v.textContent=i.value;post('/api/rules/'+link,{[f]:+i.value})};h.appendChild(r)});w.appendChild(h)}}
+const post=(u,b)=>fetch(API_BASE + u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});
+$('start').onclick=()=>post('/api/start');$('reset').onclick=()=>post('/api/reset');
+$('jam').onclick=async()=>{await post('/api/rules/alpha',{delay:8,jitter:3,dropout:.4,conflict:.4,spoof:.2})};
+$('clear').onclick=async()=>{for(const l of['alpha','bravo'])await post('/api/rules/'+l,{delay:.5,jitter:.3,dropout:0,conflict:0,spoof:0})};
+$('aarbtn').onclick=async()=>{const a=await (await fetch(API_BASE + '/api/aar')).json();const box=$('aar');box.hidden=false;
+  const sm=Object.entries(a.summary).map(([r,s])=>`<tr><td>${r}</td><td>${s.reports_sent}</td><td>${s.dropped}</td><td>${s.conflicting}</td><td>${s.spoofed}</td><td>${s.mean_delay_s??'-'}</td></tr>`).join('');
+  const dc=a.decisions.map(d=>`<tr><td>${d.t}</td><td>${d.role}</td><td>${d.action} ${d.target?d.target.join('/'):''}</td><td>${esc(d.rationale)}</td><td>${d.believed_enemy?d.believed_enemy.join('/'):'-'}</td><td>${d.true_enemy?d.true_enemy.join('/'):'-'}</td><td>${d.uncertainty}</td><td><b>${d.label}</b></td></tr>`).join('');
+  box.innerHTML=`<h3>After-action review — ${esc(a.scenario)}</h3><table><tr><th>Role</th><th>Reports</th><th>Dropped</th><th>Conflicting</th><th>Spoofed</th><th>Mean delay s</th></tr>${sm}</table>
+  <h3 style="margin-top:12px">Decisions: what was believed vs what was true</h3><table><tr><th>T</th><th>Role</th><th>Order</th><th>Rationale</th><th>Believed enemy</th><th>True enemy</th><th>Uncertainty</th><th>Assessment</th></tr>${dc||'<tr><td colspan=8>No decisions logged.</td></tr>'}</table>
+  <div class="row"><button id="dl">Download JSON</button></div>`;
+  $('dl').onclick=()=>{const b=new Blob([JSON.stringify(a,null,2)],{type:'application/json'});const l=document.createElement('a');l.href=URL.createObjectURL(b);l.download='aar.json';l.click()}};
+</script></body></html>
